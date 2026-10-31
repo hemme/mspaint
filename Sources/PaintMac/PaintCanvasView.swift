@@ -116,6 +116,8 @@ final class PaintCanvasView: NSView {
     /// once per real transition rather than once per assignment: re-reading the same
     /// entity's committed transform after a drag is not a selection change.
     private var reportedSelection: UUID?
+    /// True once `onMarqueeChange` last reported a marquee present.
+    private var reportedMarquee = false
     /// True only while `apply` runs, which is inside a SwiftUI view update. A report
     /// raised there publishes SwiftUI state, which an update may not do, so it is
     /// handed over on the next pass of the run loop instead.
@@ -131,6 +133,10 @@ final class PaintCanvasView: NSView {
     private struct Marquee {
         var rect: CGRect
         var offset: CGSize
+        /// For a pasted selection: the pixels float here, outside the
+        /// document, until the drop. nil for a marquee over pixels already
+        /// in the canvas, which is what makes a move erase its source.
+        var pastedImage: CGImage?
 
         /// Where the captured bitmap currently sits, the rectangle the ants
         /// outline and the commit's target.
@@ -146,6 +152,11 @@ final class PaintCanvasView: NSView {
     private var floatingImage: CGImage?
     private var floatingImageRevision = -1
     private var floatingImageKey: (UInt8, UInt8, UInt8, UInt8)?
+    /// The pasted float's keyed variant. Depends only on the image and the
+    /// key colour, not on the document revision.
+    private var keyedPastedImage: CGImage?
+    private var keyedPastedSource: CGImage?
+    private var keyedPastedKey: (UInt8, UInt8, UInt8, UInt8)?
 
     // MARK: Configuration
 
@@ -165,6 +176,9 @@ final class PaintCanvasView: NSView {
     var onSelectTool: ((PaintTool) -> Void)?
     /// Reports the selected entity, or `nil` whenever nothing is selected.
     var onSelectionChange: ((UUID?) -> Void)?
+    /// Reports whether a Rectangular Select marquee exists, so the Edit menu
+    /// can enable Cut and Copy.
+    var onMarqueeChange: ((Bool) -> Void)?
 
     init(document: PaintDocument) {
         self.document = document
@@ -351,29 +365,30 @@ final class PaintCanvasView: NSView {
     // MARK: Marquee drawing
 
     /// The raster selection chrome and, while a move is in flight, the float
-    /// itself. A resting marquee outlines pixels that are still in the
-    /// document, so the composite underneath is already correct and only the
-    /// ants are drawn. A floating one has moved: the hole the pixels left
-    /// behind is painted over with Color 2 and the captured bitmap is drawn
-    /// wherever the drag has carried it — preview only, the document still
-    /// holds the un-moved pixels and one `moveSelection` will settle it.
+    /// itself. A resting marquee over document pixels outlines pixels that
+    /// are still in the document, so only the ants are drawn. A moved one has
+    /// the hole painted over with Color 2 and the captured bitmap drawn
+    /// wherever the drag has carried it. A pasted float draws its bitmap at
+    /// rest too, because its pixels were never in the document: nothing it
+    /// does touches the canvas until the drop, exactly like an independent
+    /// layer, and one `PaintDocument.dropImage` settles it.
     private func drawMarquee(in context: CGContext) {
         guard tool == .rectSelect else { return }
 
-        if let marquee, marquee.offset != .zero {
-            fillMarqueeHole(marquee.rect, in: context)
-            drawFloatingMarquee(marquee, in: context)
+        if let marquee {
+            let pasted = marquee.pastedImage != nil
+            if pasted || marquee.offset != .zero {
+                if !pasted {
+                    fillMarqueeHole(marquee.rect, in: context)
+                }
+                drawFloatingMarquee(marquee, in: context)
+            }
             drawMarchingAnts(around: CGPath(rect: viewRect(for: marquee.destination), transform: nil), in: context)
             return
         }
 
         if case .marquee = gesture, let framed = snappedMarqueeRect(from: marqueeStart, to: marqueeEnd) {
             drawMarchingAnts(around: CGPath(rect: viewRect(for: framed), transform: nil), in: context)
-            return
-        }
-
-        if let marquee {
-            drawMarchingAnts(around: CGPath(rect: viewRect(for: marquee.rect), transform: nil), in: context)
         }
     }
 
@@ -390,7 +405,10 @@ final class PaintCanvasView: NSView {
     }
 
     private func drawFloatingMarquee(_ marquee: Marquee, in context: CGContext) {
-        guard let image = floatingImage(for: marquee) else { return }
+        let image = marquee.pastedImage != nil
+            ? keyedPastedImage(for: marquee)
+            : floatingImage(for: marquee)
+        guard let image else { return }
         context.saveGState()
         context.clip(to: canvasRect)
         context.interpolationQuality = zoom >= 1 ? .none : .high
@@ -417,10 +435,33 @@ final class PaintCanvasView: NSView {
         return image
     }
 
+    /// The pasted bitmap keyed against the current draw mode. Unlike the
+    /// capture path it depends only on the image and the key, not on the
+    /// document, which is exactly the layer-like independence a paste has
+    /// until the drop.
+    private func keyedPastedImage(for marquee: Marquee) -> CGImage? {
+        guard let pasted = marquee.pastedImage else { return nil }
+        let key: NSColor? = selectionDrawMode == .transparent ? secondaryColor : nil
+        let keyComponents = key.map { PaintDocument.components(of: $0) }
+        if let keyedPastedImage,
+           keyedPastedSource === pasted,
+           Self.sameKey(keyedPastedKey, keyComponents) {
+            return keyedPastedImage
+        }
+        guard let image = document.keyedImage(pasted, key: key) else { return nil }
+        keyedPastedImage = image
+        keyedPastedSource = pasted
+        keyedPastedKey = keyComponents
+        return image
+    }
+
     private func invalidateFloatingImage() {
         floatingImage = nil
         floatingImageRevision = -1
         floatingImageKey = nil
+        keyedPastedImage = nil
+        keyedPastedSource = nil
+        keyedPastedKey = nil
     }
 
     /// Tuples carry no `==`, and optionals of them none either.
@@ -897,6 +938,7 @@ final class PaintCanvasView: NSView {
         case .marquee:
             if let rect = snappedMarqueeRect(from: marqueeStart, to: point) {
                 marquee = Marquee(rect: rect, offset: .zero)
+                reportMarquee()
             } else {
                 // A click that framed no pixel is a deselect, like classic Paint.
                 dropMarquee()
@@ -1126,6 +1168,24 @@ final class PaintCanvasView: NSView {
         onSelectionChange?(id)
     }
 
+    /// Hands the marquee's existence to `onMarqueeChange`, once per transition,
+    /// with the same apply-time deferral as the entity selection report: a
+    /// tool switch commits and drops the marquee from inside `apply`.
+    private func reportMarquee() {
+        guard !isApplyingState else {
+            DispatchQueue.main.async { [weak self] in self?.deliverMarqueeReport() }
+            return
+        }
+        deliverMarqueeReport()
+    }
+
+    private func deliverMarqueeReport() {
+        let has = marquee != nil
+        guard has != reportedMarquee else { return }
+        reportedMarquee = has
+        onMarqueeChange?(has)
+    }
+
     /// Any edit the selection did not make — undo, redo, a canvas resize, a recolor
     /// driven from the colour wells — bumps the revision under the selection, so the
     /// frame is re-read from the entity itself: its own local bounds and its own
@@ -1210,18 +1270,33 @@ final class PaintCanvasView: NSView {
         return CGRect(x: x0, y: y0, width: x1 - x0, height: y1 - y0)
     }
 
-    /// Settles a floating marquee into the document as its one undoable move,
-    /// then lets the rectangle go. A marquee at rest, or one dropped exactly
-    /// where it was captured, changed no pixels — it is simply released, which
-    /// keeps Escape over a fresh marquee from baking the entities under it.
+    /// Settles a marquee into the document as its one undoable step, then
+    /// lets the rectangle go. Two kinds of settle exist. A marquee over
+    /// document pixels at rest changed nothing and is simply released, which
+    /// keeps Escape over a fresh marquee from baking the entities under it;
+    /// a moved one commits as `PaintDocument.moveSelection`. A pasted float
+    /// always commits, even in place, because its pixels were never in the
+    /// document: the drop is the single mutation of the whole paste, which is
+    /// what makes the float behave like a layer until this moment.
     private func commitMarquee() {
         defer {
             dropMarquee()
             needsDisplay = true
             window?.invalidateCursorRects(for: self)
         }
-        guard let marquee, marquee.offset != .zero else { return }
+        guard let marquee else { return }
 
+        if let pasted = marquee.pastedImage {
+            let destination = marquee.destination
+            document.dropImage(
+                pasted,
+                at: CGPoint(x: destination.minX, y: destination.minY),
+                key: selectionDrawMode == .transparent ? secondaryColor : nil
+            )
+            return
+        }
+
+        guard marquee.offset != .zero else { return }
         let destination = marquee.destination
         guard destination != marquee.rect else { return }
 
@@ -1238,6 +1313,7 @@ final class PaintCanvasView: NSView {
         guard marquee != nil else { return }
         marquee = nil
         invalidateFloatingImage()
+        reportMarquee()
         needsDisplay = true
         window?.invalidateCursorRects(for: self)
     }
@@ -1245,11 +1321,17 @@ final class PaintCanvasView: NSView {
     /// Delete and Backspace over a marquee: the rectangle's pixels go and the
     /// hole fills with Color 2, the classic Paint delete-selection. A float
     /// snaps home first, so the pixels that go are the ones the rectangle
-    /// still frames on the canvas.
+    /// still frames on the canvas. A pasted float has no pixels in the
+    /// document, so deleting it just discards the float, with no history
+    /// entry and no change to the canvas.
     private func deleteMarquee() {
         guard marquee != nil else { return }
         if case .marqueeMove = gesture {
             cancelGesture()
+        }
+        if marquee?.pastedImage != nil {
+            dropMarquee()
+            return
         }
         marquee?.offset = .zero
         if let framed = marquee?.rect {
@@ -1767,6 +1849,157 @@ final class PaintCanvasView: NSView {
     }
 }
 
+// MARK: - Clipboard commands
+
+/// The Edit-menu clipboard commands. They live on the canvas because the
+/// marquee and its floating pixels live there; the session only forwards and
+/// owns the file panel for Paste From File.
+@MainActor
+protocol PaintCanvasCommands: AnyObject {
+    /// Writes the marquee's pixels to the pasteboard as TIFF and PNG.
+    func copySelectionToPasteboard()
+    /// Copies, then empties the rectangle into Color 2.
+    func cutSelectionToPasteboard()
+    /// Stamps the pasteboard image at the canvas top-left and selects it.
+    func pasteFromPasteboard()
+    /// Loads an image file and pastes it the same way.
+    func pasteImage(at url: URL)
+    /// Frames the whole canvas with the marquee.
+    func selectAllPixels()
+}
+
+extension PaintCanvasView: PaintCanvasCommands {
+
+    /// The capture goes out unkeyed, whatever the draw mode: classic Paint
+    /// copies the raw bitmap and lets the destination decide how to show it,
+    /// and pasting back into this app re-applies the mode at drop time. A
+    /// pasted float copies its own image, which is precisely its pixels.
+    func copySelectionToPasteboard() {
+        guard let marquee else { return }
+        let image = marquee.pastedImage ?? document.selectionImage(in: marquee.rect, key: nil)
+        guard let image else { return }
+        let nsImage = NSImage(
+            cgImage: image,
+            size: NSSize(width: image.width, height: image.height)
+        )
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.writeObjects([nsImage])
+        if let tiff = nsImage.tiffRepresentation,
+           let representation = NSBitmapImageRep(data: tiff),
+           let png = representation.representation(using: .png, properties: [:]) {
+            pasteboard.setData(png, forType: .png)
+        }
+    }
+
+    func cutSelectionToPasteboard() {
+        guard marquee != nil else { return }
+        copySelectionToPasteboard()
+        deleteMarquee()
+    }
+
+    func pasteFromPasteboard() {
+        guard
+            let image = NSPasteboard.general.readObjects(
+                forClasses: [NSImage.self],
+                options: nil
+            )?.first as? NSImage,
+            let bitmap = image.cgImage(forProposedRect: nil, context: nil, hints: nil)
+        else { return }
+        paste(bitmap)
+    }
+
+    func pasteImage(at url: URL) {
+        guard
+            let image = NSImage(contentsOf: url),
+            let bitmap = image.cgImage(forProposedRect: nil, context: nil, hints: nil)
+        else { return }
+        paste(bitmap)
+    }
+
+    /// The paste landing: whatever floats is settled first, exactly the way
+    /// classic Paint drops the old selection when a new one arrives, then the
+    /// image becomes a floating selection anchored at the canvas top-left.
+    /// When the image needs more room than the canvas has, classic Paint asks
+    /// before pasting: expand the canvas to fit, or keep the size and crop.
+    /// The float itself lives in the marquee until the drop, so what is under
+    /// it stays intact while it is dragged around.
+    private func paste(_ image: CGImage) {
+        if case .marqueeMove = gesture {
+            cancelGesture()
+        }
+        commitMarquee()
+
+        let size = document.canvasSize
+        if image.width > Int(size.width) || image.height > Int(size.height) {
+            if Self.confirmPasteExpansion() {
+                // The enlarged area takes the background colour, the same
+                // convention the eraser and Clear follow.
+                document.resize(
+                    width: image.width,
+                    height: image.height,
+                    background: secondaryColor
+                )
+            }
+        }
+
+        guard
+            let cropped = document.croppedImage(of: image, limit: document.canvasSize)
+        else { return }
+        // Classic Paint hands every paste to the selection tool: the float is
+        // the Rectangular Select marquee, so the tool comes with it and the
+        // paste is visible and draggable right away, whatever was active.
+        onSelectTool?(.rectSelect)
+        let expanded = document.canvasSize
+        marquee = Marquee(
+            rect: CGRect(
+                x: 0,
+                y: expanded.height - CGFloat(cropped.height),
+                width: CGFloat(cropped.width),
+                height: CGFloat(cropped.height)
+            ),
+            offset: .zero,
+            pastedImage: cropped
+        )
+        reportMarquee()
+        needsDisplay = true
+        window?.invalidateCursorRects(for: self)
+    }
+
+    /// The classic Paint paste question, asked only when the image needs more
+    /// room than the canvas has. Escape or Cancel keeps the canvas size and
+    /// crops, which loses nothing.
+    private static func confirmPasteExpansion() -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "The image being pasted is larger than the canvas."
+        alert.informativeText = "Expand the canvas to fit the whole image, or keep the canvas size and paste only the part that fits?"
+        alert.addButton(withTitle: "Expand Canvas")
+        alert.addButton(withTitle: "Paste Cropped")
+        alert.buttons[1].keyEquivalent = "\u{1b}"
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    /// Select All as classic Paint means it with a selection tool: the whole
+    /// canvas becomes the marquee. Coming from the entity Select tool the
+    /// switch is routed through the session, which clears that selection on
+    /// the way; a floating marquee is committed before the new frame.
+    func selectAllPixels() {
+        if case .marqueeMove = gesture {
+            cancelGesture()
+        }
+        commitMarquee()
+        onSelectTool?(.rectSelect)
+        let size = document.canvasSize
+        marquee = Marquee(
+            rect: CGRect(x: 0, y: 0, width: size.width, height: size.height),
+            offset: .zero
+        )
+        reportMarquee()
+        needsDisplay = true
+        window?.invalidateCursorRects(for: self)
+    }
+}
+
 // MARK: - SwiftUI bridge
 
 struct PaintCanvasRepresentable: NSViewRepresentable {
@@ -1823,5 +2056,13 @@ struct PaintCanvasRepresentable: NSViewRepresentable {
                 session.selectedEntityID = id
             }
         }
+
+        view.onMarqueeChange = { has in
+            if session.hasMarqueeSelection != has {
+                session.hasMarqueeSelection = has
+            }
+        }
+
+        session.canvasCommands = view
     }
 }

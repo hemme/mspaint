@@ -385,8 +385,10 @@ final class ModelSmokeRun {
         try scenario("opaque selection move") { try selectionMoveOpaque() }
         try scenario("transparent selection move") { try selectionMoveTransparent() }
         try scenario("selection flattens only the covered") { try selectionFlattensOnlyTheCovered() }
+        try scenario("selection lands in front") { try selectionLandsInFront() }
         try scenario("selection delete") { try selectionDelete() }
         try scenario("selection edges and no-ops") { try selectionEdges() }
+        try scenario("image drop") { try imageDrop() }
         try scenario("colour pick") { try colourPick() }
         try scenario("tool catalogue") { try shapeCatalogue() }
         try scenario("shape geometry") { try shapeGeometry() }
@@ -1186,6 +1188,56 @@ final class ModelSmokeRun {
         try expectInk(document, 6, 12, "the moved stroke is back where it was")
     }
 
+    /// A landing bakes the entities under it, so moved pixels stay in front
+    /// of them exactly as the floating preview showed. Without this a move
+    /// dropped over a stroke would sink beneath it.
+    private func selectionLandsInFront() throws {
+        let document = PaintDocument(width: 24, height: 24)
+        doodle(document, [CGPoint(x: 4.5, y: 12.5), CGPoint(x: 9.5, y: 12.5)])
+        doodle(document, [CGPoint(x: 16.5, y: 3.5), CGPoint(x: 16.5, y: 9.5)], color: .blue)
+        let ids = document.selectableEntityIDs
+        try expectEqual(ids.count, 2, "two strokes before the move")
+        try expectPixel(document, 16, 6, .blue, "the blue stroke crosses the landing")
+
+        // The move carries the black line to y=6, crossing the blue stroke's
+        // column at x=16; the landing covers the stroke's middle.
+        document.moveSelection(
+            from: CGRect(x: 2, y: 10, width: 8, height: 5),
+            to: CGPoint(x: 12, y: 4),
+            eraseWith: .white,
+            key: nil
+        )
+
+        try expect(
+            document.selectableEntityIDs.isEmpty,
+            "both strokes bake: the source one by capture, the covered one by the landing"
+        )
+        try expectPixel(document, 16, 6, .black, "the moved ink lands in front of the covered stroke")
+        try expectPixel(document, 16, 5, .white, "the moved rectangle covers the stroke's middle like a sticker")
+        try expectPixel(document, 16, 3, .blue, "the covered stroke survives above the landing")
+        try expectPixel(document, 16, 9, .blue, "the covered stroke survives below the landing")
+        try expectPixel(document, 6, 12, .white, "the source erased")
+
+        document.undo()
+        try expect(
+            document.selectableEntityIDs == ids,
+            "undo restores both strokes"
+        )
+        try expectPixel(document, 16, 6, .blue, "the crossing is back to the stroke")
+
+        // The transparent landing keys the moved rectangle's white out, so
+        // the baked stroke shows through wherever only background moved.
+        document.moveSelection(
+            from: CGRect(x: 2, y: 10, width: 8, height: 5),
+            to: CGPoint(x: 12, y: 4),
+            eraseWith: .white,
+            key: .white
+        )
+        try expectPixel(document, 16, 6, .black, "the moved ink still lands in front")
+        try expectPixel(document, 16, 5, .blue, "keyed background leaves the covered stroke showing")
+        try expectPixel(document, 16, 3, .blue, "the stroke outside the landing survives")
+    }
+
     /// Delete over a marquee: the pixels go and the rectangle fills with the
     /// background colour, as one checkpoint.
     private func selectionDelete() throws {
@@ -1264,6 +1316,246 @@ final class ModelSmokeRun {
             "empty rectangles must leave the undo stack alone"
         )
         try expectInk(document, 6, 8, "empty rectangles change no pixel")
+    }
+
+    /// Merging a floating pasted image (`dropImage`, the clipboard landing):
+    /// opaque pixels replace, keyed pixels leave the destination alone,
+    /// semi-transparent pixels blend the way the floating preview draws
+    /// them, drops hanging off the canvas crop, and the whole merge is one
+    /// undoable step.
+    private func imageDrop() throws {
+        let document = PaintDocument(width: 8, height: 6)
+        doodle(document, [CGPoint(x: 1.5, y: 1.5), CGPoint(x: 6.5, y: 1.5)])
+        try expectInk(document, 3, 1, "the line before the drop")
+
+        // An opaque drop replaces the pixels under it; the surrounding line
+        // survives, and the whole drop is one checkpoint.
+        let image = try solidImage(width: 4, height: 3, color: .red)
+        document.dropImage(image, at: CGPoint(x: 2, y: 2), key: nil)
+        try expectPixel(document, 2, 2, .red, "the drop's bottom-left pixel")
+        try expectPixel(document, 5, 4, .red, "the drop's top-right pixel")
+        try expectInk(document, 1, 1, "the line left of the drop survives")
+        try expectInk(document, 6, 1, "the line right of the drop survives")
+
+        try expectFlags(document, undo: true, redo: false, dirty: true)
+        document.undo()
+        try expectPixel(document, 2, 2, .white, "the drop is undone")
+        try expectInk(document, 3, 1, "the line is untouched by the undo")
+        document.redo()
+        try expectPixel(document, 2, 2, .red, "the drop is redone")
+
+        // Keyed pixels leave the destination showing through: the image's
+        // black upper band is skipped entirely, the yellow lower band lands.
+        let banded = try bandedImage(width: 4, height: 4, top: .black, bottom: .yellow)
+        document.dropImage(banded, at: CGPoint(x: 0, y: 2), key: .black)
+        try expectPixel(document, 0, 2, .yellow, "the image's lower band lands at the rect's bottom")
+        try expectPixel(document, 3, 5, .white, "the keyed upper band leaves white beneath itself")
+        try expectPixel(document, 3, 4, .red, "the keyed band leaves the earlier drop alone too")
+        document.undo()
+
+        // A semi-transparent pixel blends over the destination: half-alpha
+        // black over white is mid grey, exactly what the preview shows.
+        document.dropImage(
+            try translucentImage(width: 2, height: 2, color: .black, alpha: 0.5),
+            at: CGPoint(x: 0, y: 0),
+            key: nil
+        )
+        try expectPixel(
+            document,
+            0,
+            0,
+            NSColor(srgbRed: 0.5, green: 0.5, blue: 0.5, alpha: 1),
+            "the translucent drop blends over white"
+        )
+        document.undo()
+
+        // A drop hanging off the canvas lands only its on-canvas part.
+        document.dropImage(image, at: CGPoint(x: -2, y: 4), key: nil)
+        try expectPixel(document, 0, 5, .red, "the visible part of the off-canvas drop lands")
+        try expectPixel(document, 0, 3, .white, "the off-canvas drop reaches no further down")
+
+        // Pasting an image taller than the canvas crops it to the part its
+        // top-left anchor keeps.
+        let tall = try bandedImage(width: 4, height: 8, top: .black, bottom: .yellow)
+        let cropped = try requireImage(
+            document.croppedImage(of: tall, limit: CGSize(width: 8, height: 6)),
+            "the cropped paste"
+        )
+        try expect(
+            cropped.width == 4 && cropped.height == 6,
+            "the crop is \(cropped.width)×\(cropped.height), expected 4×6"
+        )
+        document.dropImage(cropped, at: CGPoint(x: 0, y: 0), key: nil)
+        try expectPixel(document, 0, 5, .black, "the crop keeps the image's top rows at the top")
+        try expectPixel(document, 0, 0, .yellow, "the crop's lower band lands at the bottom")
+
+        // A drop lands in front of the entities under it: the covered stroke
+        // bakes into the bitmap and the dropped pixels stay on top.
+        let layered = PaintDocument(width: 12, height: 12)
+        doodle(layered, [CGPoint(x: 5.5, y: 2.5), CGPoint(x: 5.5, y: 9.5)], color: .blue)
+        try expectPixel(layered, 5, 5, .blue, "the blue stroke before the drop")
+        layered.dropImage(
+            try solidImage(width: 4, height: 4, color: .green),
+            at: CGPoint(x: 3, y: 3),
+            key: nil
+        )
+        try expectPixel(layered, 5, 5, .green, "the dropped square covers the stroke")
+        try expectPixel(layered, 5, 2, .blue, "the stroke above the drop survives")
+        try expectPixel(layered, 5, 8, .blue, "the stroke below the drop survives")
+        try expect(layered.selectableEntityIDs.isEmpty, "the covered stroke baked into the bitmap")
+        layered.undo()
+        try expectEqual(layered.selectableEntityIDs.count, 1, "undo brings the stroke back as an entity")
+        try expectPixel(layered, 5, 5, .blue, "the stroke is back over the landing")
+    }
+
+    /// A two-band CGImage: `top` fills the image's upper half, `bottom` its
+    /// lower half. The horizontal split makes an upside-down stamp visible.
+    private func bandedImage(width: Int, height: Int, top: NSColor, bottom: NSColor) throws -> CGImage {
+        guard
+            let context = CGContext(
+                data: nil,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            )
+        else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "could not create the banded fixture context",
+                file: #fileID,
+                line: #line
+            )
+        }
+        for (color, band) in [(top, CGRect(x: 0, y: height / 2, width: width, height: height - height / 2)),
+                             (bottom, CGRect(x: 0, y: 0, width: width, height: height / 2))] {
+            guard let srgb = color.usingColorSpace(.sRGB) else {
+                throw SmokeFailure(
+                    scenario: scenario,
+                    message: "banded fixture colour has no sRGB representation",
+                    file: #fileID,
+                    line: #line
+                )
+            }
+            context.setFillColor(
+                CGColor(
+                    srgbRed: srgb.redComponent,
+                    green: srgb.greenComponent,
+                    blue: srgb.blueComponent,
+                    alpha: 1
+                )
+            )
+            context.fill(band)
+        }
+        guard let image = context.makeImage() else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "could not render the banded fixture",
+                file: #fileID,
+                line: #line
+            )
+        }
+        return image
+    }
+
+    /// A CGImage of one translucent colour, premultiplied by hand and forced
+    /// with `.copy` so the bytes are exact: the fixture for blend tests.
+    private func translucentImage(width: Int, height: Int, color: NSColor, alpha: CGFloat) throws -> CGImage {
+        guard
+            let context = CGContext(
+                data: nil,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            )
+        else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "could not create the translucent fixture context",
+                file: #fileID,
+                line: #line
+            )
+        }
+        guard let srgb = color.usingColorSpace(.sRGB) else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "translucent fixture colour has no sRGB representation",
+                file: #fileID,
+                line: #line
+            )
+        }
+        context.setBlendMode(.copy)
+        context.setFillColor(
+            CGColor(
+                srgbRed: srgb.redComponent * alpha,
+                green: srgb.greenComponent * alpha,
+                blue: srgb.blueComponent * alpha,
+                alpha: alpha
+            )
+        )
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        guard let image = context.makeImage() else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "could not render the translucent fixture",
+                file: #fileID,
+                line: #line
+            )
+        }
+        return image
+    }
+
+    /// A tiny opaque CGImage of one solid colour, the fixture for paste tests.
+    private func solidImage(width: Int, height: Int, color: NSColor) throws -> CGImage {
+        guard
+            let context = CGContext(
+                data: nil,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            )
+        else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "could not create the paste fixture context",
+                file: #fileID,
+                line: #line
+            )
+        }
+        guard let srgb = color.usingColorSpace(.sRGB) else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "fixture colour has no sRGB representation",
+                file: #fileID,
+                line: #line
+            )
+        }
+        context.setFillColor(
+            CGColor(
+                srgbRed: srgb.redComponent,
+                green: srgb.greenComponent,
+                blue: srgb.blueComponent,
+                alpha: 1
+            )
+        )
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        guard let image = context.makeImage() else {
+            throw SmokeFailure(
+                scenario: scenario,
+                message: "could not render the paste fixture",
+                file: #fileID,
+                line: #line
+            )
+        }
+        return image
     }
 
     // MARK: Catalogue scenarios

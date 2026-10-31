@@ -483,7 +483,22 @@ final class PaintDocument: ObservableObject {
         ))
         fillPixelRect(rect, with: PaintDocument.components(of: eraseWith))
 
-        if !discardingPixels, let captured {
+        if !discardingPixels, let captured, target.x.isFinite, target.y.isFinite {
+            // The landing bakes the entities under it, so the moved pixels
+            // stay in front of them exactly as the floating preview showed.
+            if let destination = pixelRect(CGRect(
+                x: target.x.rounded(.down),
+                y: target.y.rounded(.down),
+                width: CGFloat(rect.width),
+                height: CGFloat(rect.height)
+            )) {
+                flattenEntities(intersecting: CGRect(
+                    x: CGFloat(destination.x),
+                    y: CGFloat(destination.y),
+                    width: CGFloat(destination.width),
+                    height: CGFloat(destination.height)
+                ))
+            }
             let keyComponents = key.map { PaintDocument.components(of: $0) }
             blitSelectionPixels(
                 captured,
@@ -539,6 +554,146 @@ final class PaintDocument: ObservableObject {
             }
         }
         return surface.context.makeImage()
+    }
+
+    /// Renders `image` with every pixel that exactly matches `key` knocked
+    /// out fully transparent: the floating preview of a pasted selection.
+    /// The drop (`dropImage`) skips the very same pixels, so what floats is
+    /// what lands.
+    func keyedImage(_ image: CGImage, key: NSColor?) -> CGImage? {
+        guard let surface = PixelBuffer(width: image.width, height: image.height) else {
+            return nil
+        }
+        surface.context.interpolationQuality = .none
+        surface.context.draw(
+            image,
+            in: CGRect(x: 0, y: 0, width: CGFloat(image.width), height: CGFloat(image.height))
+        )
+        if let key {
+            let keyComponents = PaintDocument.components(of: key)
+            for row in 0..<surface.height {
+                for column in 0..<surface.width {
+                    let base = surface.offset(x: column, y: row)
+                    let pixel = (
+                        surface.bytes[base],
+                        surface.bytes[base + 1],
+                        surface.bytes[base + 2],
+                        surface.bytes[base + 3]
+                    )
+                    if PaintDocument.matches(pixel, keyComponents, tolerance: 0) {
+                        for offset in 0...3 {
+                            surface.bytes[base + offset] = 0
+                        }
+                    }
+                }
+            }
+        }
+        return surface.context.makeImage()
+    }
+
+    /// The top-left crop of `image` when it exceeds `limit`, or the image
+    /// itself when it fits. A pasted selection lands anchored at the canvas
+    /// top-left, so only that part can ever be visible; cropping here keeps
+    /// the floating preview and the eventual drop working 1:1.
+    func croppedImage(of image: CGImage, limit: CGSize) -> CGImage? {
+        let width = min(image.width, Int(limit.width))
+        let height = min(image.height, Int(limit.height))
+        guard width >= 1, height >= 1 else { return nil }
+        guard width < image.width || height < image.height else { return image }
+        guard let crop = PixelBuffer(width: width, height: height) else { return nil }
+
+        crop.context.interpolationQuality = .none
+        // Anchor the image's top-left corner: its bottom edge hangs below the
+        // crop's bottom edge by the cropped-away amount.
+        crop.context.draw(image, in: CGRect(
+            x: 0,
+            y: CGFloat(height - image.height),
+            width: CGFloat(image.width),
+            height: CGFloat(image.height)
+        ))
+        return crop.context.makeImage()
+    }
+
+    /// Merges a floating pasted image into the canvas as exactly one
+    /// undoable step: the image's bottom-left corner lands at `target`,
+    /// cropped to the canvas. Pixels exactly matching `key` are skipped, and
+    /// every other pixel blends over the destination the way the floating
+    /// preview draws it, so a semi-transparent paste composites instead of
+    /// punching through. Nothing to land records no history.
+    func dropImage(_ image: CGImage, at target: CGPoint, key: NSColor?) {
+        guard target.x.isFinite, target.y.isFinite else { return }
+        let targetX = Int(target.x.rounded(.down))
+        let targetY = Int(target.y.rounded(.down))
+        guard
+            let rect = pixelRect(CGRect(
+                x: CGFloat(targetX),
+                y: CGFloat(targetY),
+                width: CGFloat(image.width),
+                height: CGFloat(image.height)
+            )),
+            let stamp = PixelBuffer(width: rect.width, height: rect.height)
+        else { return }
+
+        // Render the on-canvas portion of the image into an isolated buffer.
+        stamp.context.interpolationQuality = .none
+        stamp.context.draw(image, in: CGRect(
+            x: CGFloat(targetX - rect.x),
+            y: CGFloat(targetY - rect.y),
+            width: CGFloat(image.width),
+            height: CGFloat(image.height)
+        ))
+
+        let snapshot = makeSnapshot()
+        // The landing bakes the entities under it, so the pasted pixels stay
+        // in front of them exactly as the floating preview showed; without
+        // this a paste dropped over a stroke would sink beneath it.
+        flattenEntities(intersecting: CGRect(
+            x: CGFloat(rect.x),
+            y: CGFloat(rect.y),
+            width: CGFloat(rect.width),
+            height: CGFloat(rect.height)
+        ))
+        let keyComponents = key.map { PaintDocument.components(of: $0) }
+        // The stamp's rows are read through its own `offset`, which maps the
+        // stamp's y-up rows onto the backing store: reading raw backing rows
+        // would flip the image and straddle the padded `bytesPerRow`.
+        for row in 0..<rect.height {
+            let sourceBase = stamp.offset(x: 0, y: row)
+            let targetBase = buffer.offset(x: rect.x, y: rect.y + row)
+            for column in 0..<rect.width {
+                let source = sourceBase + column * 4
+                let pixel = (
+                    stamp.bytes[source],
+                    stamp.bytes[source + 1],
+                    stamp.bytes[source + 2],
+                    stamp.bytes[source + 3]
+                )
+                if let keyComponents, PaintDocument.matches(pixel, keyComponents, tolerance: 0) {
+                    continue
+                }
+                let destination = targetBase + column * 4
+                if pixel.3 == 0 {
+                    continue
+                }
+                if pixel.3 == 255 {
+                    buffer.bytes[destination] = pixel.0
+                    buffer.bytes[destination + 1] = pixel.1
+                    buffer.bytes[destination + 2] = pixel.2
+                    buffer.bytes[destination + 3] = 255
+                    continue
+                }
+                // Source-over in premultiplied space: out = src + dst * (1 - srcA).
+                let under = 255 - Int(pixel.3)
+                buffer.bytes[destination] = UInt8(min(255, Int(pixel.0) + Int(buffer.bytes[destination]) * under / 255))
+                buffer.bytes[destination + 1] = UInt8(min(255, Int(pixel.1) + Int(buffer.bytes[destination + 1]) * under / 255))
+                buffer.bytes[destination + 2] = UInt8(min(255, Int(pixel.2) + Int(buffer.bytes[destination + 2]) * under / 255))
+                buffer.bytes[destination + 3] = UInt8(min(255, Int(pixel.3) + Int(buffer.bytes[destination + 3]) * under / 255))
+            }
+        }
+
+        pushUndo(snapshot)
+        didMutateBackground()
+        markMutated()
     }
 
     /// A document-space rectangle snapped to the whole pixels it covers and
