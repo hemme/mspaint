@@ -447,6 +447,38 @@ final class PaintDocument: ObservableObject {
         }
     }
 
+    /// The finished-resize rule, classic Paint style: nothing outside the new
+    /// canvas survives. Entities fully inside stay editable, entities whose ink
+    /// straddles an edge are baked into the background — drawing clips at the
+    /// bitmap itself, which is what permanently crops the outside ink, so a
+    /// later enlargement cannot bring it back — and entities clear of the
+    /// canvas are dropped outright. Records no history of its own: the caller
+    /// owns the checkpoint.
+    private func clipEntities(to rect: CGRect) {
+        guard !entities.isEmpty else { return }
+        let context = buffer.context
+        var kept: [PaintEntity] = []
+        kept.reserveCapacity(entities.count)
+        for entity in entities {
+            let bounds = entity.bounds(applying: .identity)
+            if !bounds.isInfinite, rect.contains(bounds) {
+                kept.append(entity)
+                continue
+            }
+            // Straddling the canvas edge or unmeasurable: bake whatever part
+            // the canvas still shows. Clear of the canvas: nothing draws and
+            // the entity is dropped either way.
+            if bounds.isInfinite || bounds.intersects(rect) {
+                if entity.id == pendingStrokeID { pendingStrokeID = nil }
+                entity.draw(in: context)
+            }
+        }
+        if kept.count != entities.count {
+            entities = kept
+            cachedBackground = nil
+        }
+    }
+
     // MARK: Raster selection
 
     /// Moves the pixels of a rectangular selection as exactly one undoable
@@ -1060,6 +1092,15 @@ final class PaintDocument: ObservableObject {
 
         buffer = replacement
         canvasSize = CGSize(width: replacement.width, height: replacement.height)
+        // Classic Paint semantics for a finished resize: nothing outside the
+        // new canvas survives. The snapshot below still carries every entity,
+        // so one undo restores the pre-resize state whole.
+        clipEntities(to: CGRect(
+            x: 0,
+            y: 0,
+            width: CGFloat(replacement.width),
+            height: CGFloat(replacement.height)
+        ))
         pushUndo(snapshot)
         didMutateBackground()
         markMutated()

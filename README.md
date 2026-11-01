@@ -21,7 +21,7 @@ Paint provides the familiar simplicity of classic MS Paint in a fast Mac desktop
 - Undo and redo for drawing, transforms, recoloring, deletion, selection moves, fill, clear, and canvas changes
 - Primary and secondary colors with palette, color wells, eyedropper, and color swapping
 - Zoom from 25% to 200%
-- Resizable canvas up to 4096 × 4096 pixels
+- Resizable canvas up to 4096 × 4096 pixels, via the Resize dialog or the classic Paint corner and edge grips
 - Open PNG, JPEG, TIFF, BMP, GIF, HEIC, and other macOS-supported image formats
 - Save and export as PNG
 - Native keyboard shortcuts and custom tool cursors

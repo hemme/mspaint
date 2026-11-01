@@ -412,6 +412,7 @@ final class ModelSmokeRun {
         try scenario("entity recolour") { try entityRecolour() }
         try scenario("entity recolour no-ops") { try entityRecolourNoOps() }
         try scenario("entity flattening") { try entityFlattening() }
+        try scenario("resize clips outside entities") { try resizeClipsOutsideEntities() }
         try scenario("entities in files") { try entitiesInFiles() }
         try scenario("resize and undo across dimensions") { try resizeAcrossDimensions() }
         try scenario("png save and reopen") { try pngSaveAndReopen() }
@@ -4628,6 +4629,77 @@ final class ModelSmokeRun {
         try expect(
             nearlyEqual(unresized, box, 1e-6),
             "undoing the resize must restore the entity placement, got \(unresized)"
+        )
+    }
+
+    /// A finished resize is classic Paint: nothing outside the new canvas
+    /// survives. An entity fully inside stays editable, one whose ink straddles
+    /// an edge keeps only the pixels the canvas still shows, baked into the
+    /// background, and one clear of the canvas is dropped outright, so
+    /// enlarging again cannot resurrect any of them.
+    private func resizeClipsOutsideEntities() throws {
+        let document = PaintDocument(width: 40, height: 40)
+        // Fully inside both before and after the shrink to 20 x 20.
+        document.addShape(
+            tool: .rectangle,
+            from: CGPoint(x: 4, y: 24),
+            to: CGPoint(x: 12, y: 32),
+            color: .black,
+            constrained: false
+        )
+        // Straddles the new bottom edge once the content shifts down 20 pixels.
+        document.addShape(
+            tool: .rectangle,
+            from: CGPoint(x: 8, y: 15),
+            to: CGPoint(x: 18, y: 25),
+            color: .black,
+            constrained: false
+        )
+        // Lands clear of the 20 x 20 canvas.
+        document.addShape(
+            tool: .rectangle,
+            from: CGPoint(x: 25, y: 30),
+            to: CGPoint(x: 35, y: 38),
+            color: .black,
+            constrained: false
+        )
+        let ids = document.selectableEntityIDs
+        try expectEqual(ids.count, 3, "three entities before the resize")
+
+        document.resize(width: 20, height: 20, background: .white)
+        try expect(
+            document.selectableEntityIDs == [ids[0]],
+            "only the entity fully inside the smaller canvas stays editable, got "
+                + "\(document.selectableEntityIDs.count) entities"
+        )
+        try expectInk(document, 8, 4, "the inside entity's edge after the resize")
+        try expectInk(document, 13, 5, "the straddling entity's surviving top edge")
+        try expectInk(document, 8, 0, "the straddling entity's edge at the boundary")
+
+        // Enlarging back: the baked edge travels with the anchored content,
+        // the cropped and dropped ink does not come back.
+        document.resize(width: 40, height: 40, background: .white)
+        try expect(
+            document.selectableEntityIDs == [ids[0]],
+            "the inside entity survives the round trip editable"
+        )
+        try expectInk(document, 8, 24, "the inside entity's edge after enlarging back")
+        try expectInk(document, 13, 25, "the baked edge after enlarging back")
+        try expectPixel(document, 13, 16, .white, "the cropped edge stays gone")
+        try expectPixel(document, 30, 30, .white, "the dropped entity's edge stays gone")
+        try expectPixel(document, 35, 34, .white, "the dropped entity's other edge stays gone")
+
+        // One undo per resize; two bring the original three entities back.
+        document.undo()
+        try expect(
+            document.selectableEntityIDs == [ids[0]],
+            "undoing the enlargement returns to the shrunken state"
+        )
+        document.undo()
+        try expectEqual(
+            document.selectableEntityIDs.count,
+            3,
+            "undoing the shrink restores every entity"
         )
     }
 

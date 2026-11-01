@@ -167,6 +167,11 @@ final class PaintCanvasView: NSView {
     private var secondaryColor: NSColor = .white
     private var selectionDrawMode: SelectionDrawMode = .opaque
     private var zoom: CGFloat = 1
+    /// Document size a canvas-resize grip drag is previewing, `nil` at rest.
+    /// While set, the view grows to it, the composite is drawn anchored to the
+    /// pending canvas' top-left (the anchor `PaintDocument.resize` commits
+    /// with), and the newly uncovered area keeps the white underlay.
+    private var pendingCanvasSize: CGSize?
 
     /// Reports the pointer position in document space, or `nil` once the pointer leaves.
     var onCursorChange: ((CGPoint?) -> Void)?
@@ -200,7 +205,8 @@ final class PaintCanvasView: NSView {
         primaryColor newPrimary: NSColor,
         secondaryColor newSecondary: NSColor,
         selectionDrawMode newMode: SelectionDrawMode,
-        zoom newZoom: CGFloat
+        zoom newZoom: CGFloat,
+        pendingCanvasSize newPending: CGSize? = nil
     ) {
         isApplyingState = true
         defer { isApplyingState = false }
@@ -243,6 +249,8 @@ final class PaintCanvasView: NSView {
             window?.invalidateCursorRects(for: self)
         }
 
+        pendingCanvasSize = newPending
+
         syncSize()
         needsDisplay = true
     }
@@ -271,9 +279,11 @@ final class PaintCanvasView: NSView {
     }
 
     /// Exact, unrounded canvas extent so that `point / zoom` maps back to the same pixel
-    /// grid the document draws into.
+    /// grid the document draws into. A resize drag in flight sizes the view to the
+    /// pending canvas instead, which is what puts the border and the white new area
+    /// exactly where the commit will leave them.
     private var scaledCanvasSize: NSSize {
-        let size = document.canvasSize
+        let size = pendingCanvasSize ?? document.canvasSize
         return NSSize(
             width: max(1, size.width * zoom),
             height: max(1, size.height * zoom)
@@ -303,20 +313,44 @@ final class PaintCanvasView: NSView {
         context.fill(canvasRect)
 
         drawDocument(in: context)
-        drawMarquee(in: context)
-        drawShapePreview(in: context)
-        drawSelectionChrome(in: context)
+        // The resize preview paints only the composite: a marquee or a selection
+        // frame would be laid out against the document's own size and land in the
+        // wrong place inside the pending canvas.
+        if pendingCanvasSize == nil {
+            drawMarquee(in: context)
+            drawShapePreview(in: context)
+            drawSelectionChrome(in: context)
+        }
 
         context.setStrokeColor(NSColor.separatorColor.cgColor)
         context.setLineWidth(1)
         context.stroke(canvasRect.insetBy(dx: 0.5, dy: 0.5))
     }
 
+    /// With a resize in flight the composite is drawn anchored to the pending
+    /// canvas' top-left, in the exact rectangle `PaintDocument.resize` will
+    /// leave it in, and the rest of the view keeps the white underlay.
+    ///
     /// With nothing selected the document's own composite is a single image. With a
     /// selection the scene is drawn without the selected entity and the entity is
     /// drawn above it through the candidate absolute transform, so what is on screen
     /// during a drag is exactly what `setEntityTransform` commits on mouse up.
     private func drawDocument(in context: CGContext) {
+        if let pending = pendingCanvasSize {
+            let current = document.canvasSize
+            draw(
+                image: document.cgImage,
+                in: CGRect(
+                    x: 0,
+                    y: (pending.height - current.height) * zoom,
+                    width: current.width * zoom,
+                    height: current.height * zoom
+                ),
+                in: context
+            )
+            return
+        }
+
         guard let selection else {
             draw(image: document.cgImage, in: context)
             return
@@ -336,10 +370,14 @@ final class PaintCanvasView: NSView {
     }
 
     private func draw(image: CGImage?, in context: CGContext) {
+        draw(image: image, in: canvasRect, in: context)
+    }
+
+    private func draw(image: CGImage?, in rect: CGRect, in context: CGContext) {
         guard let image else { return }
         context.saveGState()
         context.interpolationQuality = zoom >= 1 ? .none : .high
-        context.draw(image, in: canvasRect)
+        context.draw(image, in: rect)
         context.restoreGState()
     }
 
@@ -2008,6 +2046,8 @@ struct PaintCanvasRepresentable: NSViewRepresentable {
     /// `PaintSession.setPrimaryColor`, which also repaints the selected entity.
     @ObservedObject var session: PaintSession
     @ObservedObject var document: PaintDocument
+    /// Document size a canvas-resize grip drag is previewing, `nil` at rest.
+    var pendingCanvasSize: CGSize?
 
     func makeNSView(context: Context) -> PaintCanvasView {
         let view = PaintCanvasView(document: document)
@@ -2023,7 +2063,8 @@ struct PaintCanvasRepresentable: NSViewRepresentable {
             primaryColor: NSColor(session.primaryColor),
             secondaryColor: NSColor(session.secondaryColor),
             selectionDrawMode: session.selectionDrawMode,
-            zoom: CGFloat(session.zoom)
+            zoom: CGFloat(session.zoom),
+            pendingCanvasSize: pendingCanvasSize
         )
     }
 
